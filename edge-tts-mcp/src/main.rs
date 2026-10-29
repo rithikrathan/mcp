@@ -70,11 +70,17 @@ fn strip_markdown(text: &str) -> String {
     let re_num = Regex::new(r"(?m)^\s*\d+\.\s+").unwrap();
     let text = re_num.replace_all(&text, "");
 
-    let re_bold = Regex::new(r"(\*\*|__)(.*?)\1").unwrap();
-    let text = re_bold.replace_all(&text, "$2");
+    let re_bold1 = Regex::new(r"\*\*(.*?)\*\*").unwrap();
+    let text = re_bold1.replace_all(&text, "$1");
 
-    let re_italic = Regex::new(r"(\*|_)(.*?)\1").unwrap();
-    let text = re_italic.replace_all(&text, "$2");
+    let re_bold2 = Regex::new(r"__(.*?)__").unwrap();
+    let text = re_bold2.replace_all(&text, "$1");
+
+    let re_italic1 = Regex::new(r"\*(.*?)\*").unwrap();
+    let text = re_italic1.replace_all(&text, "$1");
+
+    let re_italic2 = Regex::new(r"_(.*?)_").unwrap();
+    let text = re_italic2.replace_all(&text, "$1");
 
     let re_tree = Regex::new(r"[├└│─┌┐┘└┬┴┼═║╒╓╔╕╖╗╘╙╚╛╜╝╞╟╠╡╢╣╤╥╦╧╨╩╪╫╬]+").unwrap();
     let text = re_tree.replace_all(&text, "");
