@@ -182,8 +182,12 @@ fn speak_handler(args: &Value) -> Result<String, String> {
 
     let paused = get_playing_players();
 
-    // Prepend throwaway leading prefix in code so DAC wake-up never clips the user text
-    let formatted_text = format!("The, h h {}", cleaned);
+    // Reason: Microsoft edge-tts generates audio starting at millisecond zero without
+    // a leading silence pad. Downstream audio hardware (DAC, headphone amplifier, PipeWire)
+    // takes ~150-250ms to ramp up upon stream start, cutting off the first syllable.
+    // Prepending "The, " provides a sacrificial initial syllable so the user's actual text
+    // is always heard with 100% clarity.
+    let formatted_text = format!("The, {}", cleaned);
 
     let temp_dir = std::env::temp_dir();
     let txt_path = temp_dir.join(format!("edge_tts_{}.txt", std::process::id()));
