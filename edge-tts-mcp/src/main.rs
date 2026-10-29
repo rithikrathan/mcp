@@ -244,20 +244,24 @@ fn speak_handler(args: &Value) -> Result<String, String> {
         mp3_path.to_str().unwrap(),
     ]);
 
-    if let Ok(mut child) = play_cmd.spawn() {
-        let pid = child.id() as i32;
-        ACTIVE_PID.store(pid, Ordering::SeqCst);
-        let _ = std::fs::write("/tmp/edge_tts_mcp.pid", pid.to_string());
+    let child = play_cmd.spawn()
+        .map_err(|e| format!("Failed to spawn ffplay: {}", e))?;
+
+    let pid = child.id() as i32;
+    ACTIVE_PID.store(pid, Ordering::SeqCst);
+    let _ = std::fs::write("/tmp/edge_tts_mcp.pid", pid.to_string());
+
+    // Background thread cleans up process and temp files when playback finishes
+    std::thread::spawn(move || {
+        let mut child = child;
         let _ = child.wait();
         ACTIVE_PID.store(0, Ordering::SeqCst);
         let _ = std::fs::remove_file("/tmp/edge_tts_mcp.pid");
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
+        let _ = std::fs::remove_file(&mp3_path);
+        resume_players(&paused);
+    });
 
-    resume_players(&paused);
-    let _ = std::fs::remove_file(&mp3_path);
-
-    Ok("Spoken successfully.".to_string())
+    Ok("Playing audio in background.".to_string())
 }
 
 fn stop_handler() -> String {
