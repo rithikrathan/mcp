@@ -136,6 +136,8 @@ fn resume_players(players: &[String]) {
 }
 
 fn speak_handler(args: &Value) -> Result<String, String> {
+    // If speech is already playing, stop it immediately before starting new speech
+    stop_handler();
     let mut raw_text = String::new();
 
     if let Some(path) = args.get("file_path").and_then(|v| v.as_str()) {
@@ -243,9 +245,12 @@ fn speak_handler(args: &Value) -> Result<String, String> {
     ]);
 
     if let Ok(mut child) = play_cmd.spawn() {
-        ACTIVE_PID.store(child.id() as i32, Ordering::SeqCst);
+        let pid = child.id() as i32;
+        ACTIVE_PID.store(pid, Ordering::SeqCst);
+        let _ = std::fs::write("/tmp/edge_tts_mcp.pid", pid.to_string());
         let _ = child.wait();
         ACTIVE_PID.store(0, Ordering::SeqCst);
+        let _ = std::fs::remove_file("/tmp/edge_tts_mcp.pid");
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
 
