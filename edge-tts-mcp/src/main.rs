@@ -182,12 +182,15 @@ fn speak_handler(args: &Value) -> Result<String, String> {
 
     let paused = get_playing_players();
 
+    // Prepend a pause symbol so the synthesized speech has a natural 300ms leading silence
+    let formatted_text = format!("... {}", cleaned);
+
     let temp_dir = std::env::temp_dir();
     let txt_path = temp_dir.join(format!("edge_tts_{}.txt", std::process::id()));
     let mp3_path = temp_dir.join(format!("edge_tts_{}.mp3", std::process::id()));
 
     if let Ok(mut f) = File::create(&txt_path) {
-        let _ = f.write_all(cleaned.as_bytes());
+        let _ = f.write_all(formatted_text.as_bytes());
     }
 
     let edge_bin = dirs_next().unwrap_or_else(|| "edge-tts".to_string());
@@ -230,6 +233,7 @@ fn speak_handler(args: &Value) -> Result<String, String> {
         "--no-terminal",
         &format!("--volume={}", volume),
         "--gapless-audio=yes",
+        "--audio-wait-open=0.35",
     ]);
 
     if !audio_device.is_empty() && audio_device != "auto" {
