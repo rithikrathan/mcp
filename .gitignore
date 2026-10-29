@@ -1,0 +1,7 @@
+target/
+**/target/
+Cargo.lock
+**/*.rs.bk
+*.mp3
+*.wav
+*.pid
