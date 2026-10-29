@@ -228,25 +228,19 @@ fn speak_handler(args: &Value) -> Result<String, String> {
     // Pre-playback settle time (0.2s) to allow audio sink/hardware routing to open cleanly
     std::thread::sleep(std::time::Duration::from_millis(200));
 
-    let mut mpv_cmd = Command::new("mpv");
-    mpv_cmd.args([
-        "--no-terminal",
-        &format!("--volume={}", volume),
-        "--gapless-audio=yes",
-        "--af=adelay=500|500",
+    let mut play_cmd = Command::new("ffplay");
+    play_cmd.args([
+        "-nodisp",
+        "-autoexit",
+        "-loglevel", "quiet",
+        "-volume", &volume.to_string(),
+        mp3_path.to_str().unwrap(),
     ]);
 
-    if !audio_device.is_empty() && audio_device != "auto" {
-        mpv_cmd.arg(format!("--audio-device={}", audio_device));
-    }
-
-    mpv_cmd.arg(mp3_path.to_str().unwrap());
-
-    if let Ok(mut child) = mpv_cmd.spawn() {
+    if let Ok(mut child) = play_cmd.spawn() {
         ACTIVE_PID.store(child.id() as i32, Ordering::SeqCst);
         let _ = child.wait();
         ACTIVE_PID.store(0, Ordering::SeqCst);
-        // Post-playback flush time (0.5s) to allow hardware buffer to drain fully
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
 
@@ -264,6 +258,7 @@ fn stop_handler() -> String {
         }
         return format!("Stopped active playback (PID {}).", pid);
     }
+    let _ = Command::new("killall").arg("ffplay").output();
     let _ = Command::new("killall").arg("mpv").output();
     let _ = Command::new("playerctl").arg("play").output();
     "Stopped mpv playback.".to_string()
