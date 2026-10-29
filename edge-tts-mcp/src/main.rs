@@ -222,6 +222,8 @@ fn speak_handler(args: &Value) -> Result<String, String> {
     }
 
     pause_players(&paused);
+    // Pre-playback settle time (0.2s) to allow audio sink/hardware routing to open cleanly
+    std::thread::sleep(std::time::Duration::from_millis(200));
 
     let mut mpv_cmd = Command::new("mpv");
     mpv_cmd.args([
@@ -240,7 +242,8 @@ fn speak_handler(args: &Value) -> Result<String, String> {
         ACTIVE_PID.store(child.id() as i32, Ordering::SeqCst);
         let _ = child.wait();
         ACTIVE_PID.store(0, Ordering::SeqCst);
-        std::thread::sleep(std::time::Duration::from_millis(400));
+        // Post-playback flush time (0.5s) to allow hardware buffer to drain fully
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
 
     resume_players(&paused);
