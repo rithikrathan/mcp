@@ -233,7 +233,7 @@ fn speak_handler(args: &Value) -> Result<String, String> {
         "--no-terminal",
         &format!("--volume={}", volume),
         "--gapless-audio=yes",
-        "--audio-wait-open=0.35",
+        "--af=adelay=500|500",
     ]);
 
     if !audio_device.is_empty() && audio_device != "auto" {
