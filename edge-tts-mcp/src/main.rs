@@ -183,7 +183,7 @@ fn speak_handler(args: &Value) -> Result<String, String> {
     let paused = get_playing_players();
 
     // Prepend throwaway leading prefix in code so DAC wake-up never clips the user text
-    let formatted_text = format!("The, {}", cleaned);
+    let formatted_text = format!("The, h h {}", cleaned);
 
     let temp_dir = std::env::temp_dir();
     let txt_path = temp_dir.join(format!("edge_tts_{}.txt", std::process::id()));
