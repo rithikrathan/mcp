@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+
+FORCE=false
+while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+        -f|--force) FORCE=true; shift ;;
+        *) shift ;;
+    esac
+done
+
+SOCKET_PATH="/tmp/edge_tts_mcp.sock"
+
+# Try sending command to the socket using python
+if [ -S "$SOCKET_PATH" ]; then
+    CMD="stop"
+    [ "$FORCE" = true ] && CMD="stop_all"
+    python3 -c "
+import socket
+try:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        s.connect('$SOCKET_PATH')
+        s.sendall(b'$CMD\n')
+        s.recv(1024)
+except Exception:
+    pass
+" 2>/dev/null || true
+fi
+
+# Fallback: handle PID files and processes
+if [ "$FORCE" = true ]; then
+    for pid_file in "/tmp/md2tts.pid" "/tmp/edge_tts_mcp.pid"; do
+        if [ -f "$pid_file" ]; then
+            PID=$(cat "$pid_file")
+            kill -9 "$PID" 2>/dev/null || true
+            rm -f "$pid_file"
+        fi
+    done
+    killall -9 ffplay 2>/dev/null || true
+    killall -9 mpv 2>/dev/null || true
+    playerctl play 2>/dev/null || true
+    echo "TTS queue cleared and audio halted."
+else
+    if [ -f "/tmp/edge_tts_mcp.pid" ]; then
+        PID=$(cat "/tmp/edge_tts_mcp.pid")
+        kill -TERM "$PID" 2>/dev/null || true
+        rm -f "/tmp/edge_tts_mcp.pid"
+    else
+        killall -TERM ffplay 2>/dev/null || true
+    fi
+    echo "Skipped active TTS item."
+fi

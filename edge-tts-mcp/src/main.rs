@@ -1,12 +1,44 @@
+use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, BufRead, Write};
+use std::os::unix::net::UnixListener;
 use std::process::Command;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 static ACTIVE_PID: AtomicI32 = AtomicI32::new(0);
+
+#[derive(Clone, Debug)]
+struct SpeechTask {
+    text: String,
+    voice: String,
+    rate: String,
+    volume: i64,
+    append_flush: bool,
+    max_retries: u32,
+}
+
+struct QueueState {
+    queue: VecDeque<SpeechTask>,
+    current_child: Option<u32>,
+    paused_players: Vec<String>,
+}
+
+static QUEUE_STATE: Lazy<(Mutex<QueueState>, Condvar)> = Lazy::new(|| {
+    (
+        Mutex::new(QueueState {
+            queue: VecDeque::new(),
+            current_child: None,
+            paused_players: Vec::new(),
+        }),
+        Condvar::new(),
+    )
+});
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
@@ -135,9 +167,261 @@ fn resume_players(players: &[String]) {
     }
 }
 
+fn dirs_next() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let path = format!("{}/.local/bin/edge-tts", home);
+    if std::path::Path::new(&path).exists() {
+        Some(path)
+    } else {
+        Some("edge-tts".to_string())
+    }
+}
+
+unsafe fn libc_kill(pid: i32, sig: i32) {
+    let _ = Command::new("kill")
+        .args([&format!("-{}", sig), &pid.to_string()])
+        .output();
+}
+
+fn start_worker_thread() {
+    std::thread::spawn(move || {
+        let (lock, cvar) = &*QUEUE_STATE;
+        loop {
+            let task = {
+                let mut state = lock.lock().unwrap();
+                while state.queue.is_empty() {
+                    if !state.paused_players.is_empty() {
+                        let players = std::mem::replace(&mut state.paused_players, Vec::new());
+                        resume_players(&players);
+                    }
+                    state = cvar.wait(state).unwrap();
+                }
+                state.queue.pop_front().unwrap()
+            };
+
+            let formatted_text = if task.append_flush {
+                format!("The, {}", task.text)
+            } else {
+                task.text.clone()
+            };
+
+            let temp_dir = std::env::temp_dir();
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let txt_path = temp_dir.join(format!("edge_tts_{}_{}.txt", std::process::id(), timestamp));
+            let mp3_path = temp_dir.join(format!("edge_tts_{}_{}.mp3", std::process::id(), timestamp));
+
+            if let Ok(mut f) = File::create(&txt_path) {
+                let _ = f.write_all(formatted_text.as_bytes());
+            }
+
+            let edge_bin = dirs_next().unwrap_or_else(|| "edge-tts".to_string());
+            let max_retries = task.max_retries.max(1);
+            let mut attempts = 0;
+            let mut success = false;
+
+            while attempts < max_retries {
+                attempts += 1;
+                let tts_res = Command::new(&edge_bin)
+                    .args([
+                        "--file",
+                        txt_path.to_str().unwrap(),
+                        "--voice",
+                        &task.voice,
+                        "--rate",
+                        &task.rate,
+                        "--write-media",
+                        mp3_path.to_str().unwrap(),
+                    ])
+                    .output();
+
+                match tts_res {
+                    Ok(out) if out.status.success() => {
+                        success = true;
+                        if attempts > 1 {
+                            let _ = std::fs::write(
+                                "/tmp/edge_tts_mcp.log",
+                                format!("edge-tts succeeded after {} attempts.\n", attempts),
+                            );
+                        }
+                        break;
+                    }
+                    Ok(out) => {
+                        let err = String::from_utf8_lossy(&out.stderr);
+                        let _ = std::fs::write(
+                            "/tmp/edge_tts_mcp.log",
+                            format!("edge-tts attempt {} failed: {}\n", attempts, err),
+                        );
+                        if attempts < max_retries {
+                            std::thread::sleep(Duration::from_millis(400 * attempts as u64));
+                        }
+                    }
+                    Err(e) => {
+                        let _ = std::fs::write(
+                            "/tmp/edge_tts_mcp.log",
+                            format!("edge-tts attempt {} exec error: {}\n", attempts, e),
+                        );
+                        if attempts < max_retries {
+                            std::thread::sleep(Duration::from_millis(400 * attempts as u64));
+                        }
+                    }
+                }
+            }
+
+            let _ = std::fs::remove_file(&txt_path);
+
+            if success {
+                {
+                    let mut state = lock.lock().unwrap();
+                    let active = get_playing_players();
+                    for p in active {
+                        if !state.paused_players.contains(&p) {
+                            state.paused_players.push(p);
+                        }
+                    }
+                    pause_players(&state.paused_players);
+                }
+
+                std::thread::sleep(Duration::from_millis(150));
+
+                let mut play_cmd = Command::new("ffplay");
+                play_cmd.args([
+                    "-nodisp",
+                    "-autoexit",
+                    "-loglevel", "quiet",
+                    "-af", "adelay=250|250",
+                    "-volume", &task.volume.to_string(),
+                    mp3_path.to_str().unwrap(),
+                ]);
+
+                match play_cmd.spawn() {
+                    Ok(mut child) => {
+                        let pid = child.id() as i32;
+                        ACTIVE_PID.store(pid, Ordering::SeqCst);
+                        let _ = std::fs::write("/tmp/edge_tts_mcp.pid", pid.to_string());
+
+                        {
+                            let mut state = lock.lock().unwrap();
+                            state.current_child = Some(child.id());
+                        }
+
+                        let _ = child.wait();
+
+                        ACTIVE_PID.store(0, Ordering::SeqCst);
+                        let _ = std::fs::remove_file("/tmp/edge_tts_mcp.pid");
+                        {
+                            let mut state = lock.lock().unwrap();
+                            state.current_child = None;
+                            if state.queue.is_empty() && !state.paused_players.is_empty() {
+                                let players = std::mem::replace(&mut state.paused_players, Vec::new());
+                                resume_players(&players);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = std::fs::write("/tmp/edge_tts_mcp.log", format!("ffplay spawn error: {}\n", e));
+                    }
+                }
+            } else {
+                let mut state = lock.lock().unwrap();
+                if state.queue.is_empty() && !state.paused_players.is_empty() {
+                    let players = std::mem::replace(&mut state.paused_players, Vec::new());
+                    resume_players(&players);
+                }
+            }
+
+            let _ = std::fs::remove_file(&mp3_path);
+        }
+    });
+}
+
+fn start_ipc_server() {
+    let socket_path = "/tmp/edge_tts_mcp.sock";
+    let _ = std::fs::remove_file(socket_path);
+
+    std::thread::spawn(move || {
+        let listener = match UnixListener::bind(socket_path) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("Failed to bind IPC socket {}: {}", socket_path, e);
+                return;
+            }
+        };
+
+        for stream in listener.incoming() {
+            if let Ok(mut stream) = stream {
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_ok() {
+                    let trimmed = line.trim();
+                    let resp = if trimmed.starts_with("SPEAK ") {
+                        let json_str = &trimmed[6..];
+                        if let Ok(val) = serde_json::from_str::<Value>(json_str) {
+                            match speak_handler(&val) {
+                                Ok(m) => format!("OK {}\n", m),
+                                Err(e) => format!("ERR {}\n", e),
+                            }
+                        } else {
+                            "ERR Invalid JSON\n".to_string()
+                        }
+                    } else {
+                        match trimmed.to_lowercase().as_str() {
+                            "stop" | "skip" => {
+                                stop_current_item();
+                                "SKIPPED\n".to_string()
+                            }
+                            "stop_all" | "clear" | "force" => {
+                                stop_all_queue();
+                                "CLEARED\n".to_string()
+                            }
+                            _ => "UNKNOWN\n".to_string(),
+                        }
+                    };
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+            }
+        }
+    });
+}
+
+fn stop_current_item() {
+    let (lock, _cvar) = &*QUEUE_STATE;
+    let mut state = lock.lock().unwrap();
+    if let Some(child_pid) = state.current_child.take() {
+        unsafe {
+            libc_kill(child_pid as i32, 15);
+        }
+    }
+    ACTIVE_PID.store(0, Ordering::SeqCst);
+    let _ = std::fs::remove_file("/tmp/edge_tts_mcp.pid");
+    let _ = Command::new("killall").arg("ffplay").output();
+
+    // If nothing remains in queue, resume paused music right away
+    if state.queue.is_empty() && !state.paused_players.is_empty() {
+        let players = std::mem::replace(&mut state.paused_players, Vec::new());
+        resume_players(&players);
+    }
+}
+
+fn stop_all_queue() {
+    let (lock, _cvar) = &*QUEUE_STATE;
+    let mut state = lock.lock().unwrap();
+    state.queue.clear();
+    if let Some(child_pid) = state.current_child.take() {
+        unsafe {
+            libc_kill(child_pid as i32, 15);
+        }
+    }
+    ACTIVE_PID.store(0, Ordering::SeqCst);
+    let _ = std::fs::remove_file("/tmp/edge_tts_mcp.pid");
+    let _ = Command::new("killall").arg("ffplay").output();
+    let players = std::mem::replace(&mut state.paused_players, Vec::new());
+    resume_players(&players);
+}
+
 fn speak_handler(args: &Value) -> Result<String, String> {
-    // If speech is already playing, stop it immediately before starting new speech
-    stop_handler();
     let mut raw_text = String::new();
 
     if let Some(path) = args.get("file_path").and_then(|v| v.as_str()) {
@@ -165,132 +449,62 @@ fn speak_handler(args: &Value) -> Result<String, String> {
     let voice = args
         .get("voice")
         .and_then(|v| v.as_str())
-        .unwrap_or("en-US-AvaNeural");
+        .unwrap_or("en-US-AvaNeural")
+        .to_string();
 
     let rate = args
         .get("rate")
         .and_then(|v| v.as_str())
-        .unwrap_or("+5%");
+        .unwrap_or("+5%")
+        .to_string();
 
     let volume = args
         .get("volume")
         .and_then(|v| v.as_i64())
         .unwrap_or(115);
 
-    let audio_device = args
-        .get("audio_device")
-        .and_then(|v| v.as_str())
-        .unwrap_or("pulse/alsa_output.pci-0000_00_1f.3.analog-stereo");
+    let append_flush = args
+        .get("append_flush")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
-    let paused = get_playing_players();
+    let max_retries = args
+        .get("max_retries")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(3) as u32;
 
-    // Reason: Microsoft edge-tts generates audio starting at millisecond zero without
-    // a leading silence pad. Downstream audio hardware (DAC, headphone amplifier, PipeWire)
-    // takes ~150-250ms to ramp up upon stream start, cutting off the first syllable.
-    // Prepending "The, " provides a sacrificial initial syllable so the user's actual text
-    // is always heard with 100% clarity.
-    let formatted_text = format!("The, {}", cleaned);
+    let task = SpeechTask {
+        text: cleaned,
+        voice,
+        rate,
+        volume,
+        append_flush,
+        max_retries,
+    };
 
-    let temp_dir = std::env::temp_dir();
-    let txt_path = temp_dir.join(format!("edge_tts_{}.txt", std::process::id()));
-    let mp3_path = temp_dir.join(format!("edge_tts_{}.mp3", std::process::id()));
+    let (lock, cvar) = &*QUEUE_STATE;
+    let queue_len = {
+        let mut state = lock.lock().unwrap();
+        state.queue.push_back(task);
+        cvar.notify_one();
+        state.queue.len()
+    };
 
-    if let Ok(mut f) = File::create(&txt_path) {
-        let _ = f.write_all(formatted_text.as_bytes());
-    }
-
-    let edge_bin = dirs_next().unwrap_or_else(|| "edge-tts".to_string());
-
-    let tts_res = Command::new(&edge_bin)
-        .args([
-            "--file",
-            txt_path.to_str().unwrap(),
-            "--voice",
-            voice,
-            "--rate",
-            rate,
-            "--write-media",
-            mp3_path.to_str().unwrap(),
-        ])
-        .output();
-
-    let _ = std::fs::remove_file(&txt_path);
-
-    if let Err(e) = tts_res {
-        resume_players(&paused);
-        return Err(format!("Failed to execute edge-tts: {}", e));
-    }
-
-    let out = tts_res.unwrap();
-    if !out.status.success() {
-        resume_players(&paused);
-        return Err(format!(
-            "edge-tts error: {}",
-            String::from_utf8_lossy(&out.stderr)
-        ));
-    }
-
-    pause_players(&paused);
-    // Pre-playback settle time (0.2s) to allow audio sink/hardware routing to open cleanly
-    std::thread::sleep(std::time::Duration::from_millis(200));
-
-    let mut play_cmd = Command::new("ffplay");
-    play_cmd.args([
-        "-nodisp",
-        "-autoexit",
-        "-loglevel", "quiet",
-        "-af", "adelay=250|250",
-        "-volume", &volume.to_string(),
-        mp3_path.to_str().unwrap(),
-    ]);
-
-    let child = play_cmd.spawn()
-        .map_err(|e| format!("Failed to spawn ffplay: {}", e))?;
-
-    let pid = child.id() as i32;
-    ACTIVE_PID.store(pid, Ordering::SeqCst);
-    let _ = std::fs::write("/tmp/edge_tts_mcp.pid", pid.to_string());
-
-    // Background thread cleans up process and temp files when playback finishes
-    std::thread::spawn(move || {
-        let mut child = child;
-        let _ = child.wait();
-        ACTIVE_PID.store(0, Ordering::SeqCst);
-        let _ = std::fs::remove_file("/tmp/edge_tts_mcp.pid");
-        let _ = std::fs::remove_file(&mp3_path);
-        resume_players(&paused);
-    });
-
-    Ok("Playing audio in background.".to_string())
+    Ok(format!("Queued audio playback. Current queue length: {}.", queue_len))
 }
 
-fn stop_handler() -> String {
-    let pid = ACTIVE_PID.swap(0, Ordering::SeqCst);
-    if pid > 0 {
-        unsafe {
-            libc_kill(pid, 15);
-        }
-        return format!("Stopped active playback (PID {}).", pid);
-    }
-    let _ = Command::new("killall").arg("ffplay").output();
-    let _ = Command::new("killall").arg("mpv").output();
-    let _ = Command::new("playerctl").arg("play").output();
-    "Stopped mpv playback.".to_string()
-}
+fn stop_handler(args: &Value) -> String {
+    let force = args
+        .get("force")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
-unsafe fn libc_kill(pid: i32, sig: i32) {
-    let _ = Command::new("kill")
-        .args([&format!("-{}", sig), &pid.to_string()])
-        .output();
-}
-
-fn dirs_next() -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    let path = format!("{}/.local/bin/edge-tts", home);
-    if std::path::Path::new(&path).exists() {
-        Some(path)
+    if force {
+        stop_all_queue();
+        "Cleared TTS queue and stopped playback.".to_string()
     } else {
-        Some("edge-tts".to_string())
+        stop_current_item();
+        "Skipped current audio item.".to_string()
     }
 }
 
@@ -310,7 +524,7 @@ fn handle_call_tool(params: &Option<Value>) -> Value {
             Err(err) => json!({"isError": true, "content": [{"type": "text", "text": err}]}),
         },
         "stop" => {
-            let msg = stop_handler();
+            let msg = stop_handler(arguments);
             json!({"content": [{"type": "text", "text": msg}]})
         }
         _ => json!({"isError": true, "content": [{"type": "text", "text": format!("Unknown tool: {}", tool_name)}]}),
@@ -318,6 +532,9 @@ fn handle_call_tool(params: &Option<Value>) -> Value {
 }
 
 fn main() -> io::Result<()> {
+    start_worker_thread();
+    start_ipc_server();
+
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
@@ -359,7 +576,7 @@ fn main() -> io::Result<()> {
                             "name": "edge-tts-mcp",
                             "version": "0.1.0"
                         },
-                        "instructions": "This server provides text-to-speech narration using edge-tts. Agents should pass clean text or file paths. Use the `speak` tool ONLY when the user explicitly requests spoken audio output, wants a file read aloud, or is in hands-free interaction mode. Do NOT call this tool for standard text-based responses."
+                        "instructions": "This server provides text-to-speech narration using edge-tts with an internal queue. Agents should pass clean text or file paths. Use the `speak` tool ONLY when the user explicitly requests spoken audio output, wants a file read aloud, or is in hands-free interaction mode. Do NOT call this tool for standard text-based responses."
                     }
                 })
             }
@@ -372,7 +589,7 @@ fn main() -> io::Result<()> {
                         "tools": [
                             {
                                 "name": "speak",
-                                "description": "Synthesizes and speaks text or file content aloud using edge-tts. Call this tool ONLY when the user explicitly requests audio speech or is interacting in hands-free mode. Supports clean markdown stripping, background player ducking, and hardware routing.",
+                                "description": "Enqueues text or file content to be spoken aloud using edge-tts. Supports markdown stripping, queueing, and media player ducking.",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -399,16 +616,29 @@ fn main() -> io::Result<()> {
                                         "audio_device": {
                                             "type": "string",
                                             "description": "Hardware audio device sink (default: pulse/alsa_output.pci-0000_00_1f.3.analog-stereo)."
+                                        },
+                                        "append_flush": {
+                                            "type": "boolean",
+                                            "description": "Whether to prepend 'The, ' to flush DAC buffer (default: false)."
+                                        },
+                                        "max_retries": {
+                                            "type": "integer",
+                                            "description": "Maximum retry attempts upon network drops (default: 3)."
                                         }
                                     }
                                 }
                             },
                             {
                                 "name": "stop",
-                                "description": "Immediately halts any active TTS speech playback and resumes paused media players.",
+                                "description": "Stops TTS playback. By default skips the current item and plays the next in queue. If force=true, clears the entire queue.",
                                 "inputSchema": {
                                     "type": "object",
-                                    "properties": {}
+                                    "properties": {
+                                        "force": {
+                                            "type": "boolean",
+                                            "description": "If true, clears the entire queue and halts all speech immediately."
+                                        }
+                                    }
                                 }
                             }
                         ]

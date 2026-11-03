@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+import sys
+import os
+import re
+import socket
+import argparse
+
+SOCKET_PATH = "/tmp/edge_tts_mcp.sock"
+
+def strip_markdown(text: str) -> str:
+    text = re.sub(r"```[\s\S]*?```", "", text)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"!\[([^\]]*)\]\([^\)]+\)", "", text)
+    text = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", text)
+    text = re.sub(r"\$\\(?:left)?rightarrow\$", "to", text)
+    text = re.sub(r"\$[^$]+\$", "", text)
+    text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^[-*_]{3,}\s*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^>\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\|?\s*[-:]+[-| :]*\|?\s*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\|", " ", text)
+    text = re.sub(r"^\s*[-*+]\s*(\[[ xX]\])?\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*\d+\.\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"(\*\*|__)(.*?)\1", r"\2", text)
+    text = re.sub(r"(\*|_)(.*?)\1", r"\2", text)
+    text = re.sub(r"~~(.*?)~~", r"\1", text)
+    text = re.sub(r"[├└│─┌┐┘└┬┴┼═║╒╓╔╕╖╗╘╙╚╛╜╝╞╟╠╡╢╣╤╥╦╧╨╩╪╫╬]+", "", text)
+    text = re.sub(r":\s+", ". ", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n", "\n\n", text)
+    return text.strip()
+
+def pause_players():
+    try:
+        res = subprocess.run(["playerctl", "-l"], capture_output=True, text=True)
+        if res.returncode != 0:
+            return []
+        players = [p.strip() for p in res.stdout.splitlines() if p.strip()]
+        playing = []
+        for p in players:
+            st = subprocess.run(["playerctl", "-p", p, "status"], capture_output=True, text=True)
+            if st.stdout.strip().lower() == "playing":
+                playing.append(p)
+        for p in playing:
+            subprocess.run(["playerctl", "-p", p, "pause"], capture_output=True)
+        return playing
+    except Exception:
+        return []
+
+def resume_players(players):
+    for p in players:
+        subprocess.run(["playerctl", "-p", p, "play"], capture_output=True)
+
+def send_to_mcp(text: str, voice: str = "en-US-AvaNeural", rate: str = "+5%", volume: int = 115, append_flush: bool = False):
+    import json
+    import subprocess
+
+    payload = {
+        "text": text,
+        "voice": voice,
+        "rate": rate,
+        "volume": volume,
+        "append_flush": append_flush
+    }
+
+    if os.path.exists(SOCKET_PATH):
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.connect(SOCKET_PATH)
+                s.sendall((f"SPEAK {json.dumps(payload)}\n").encode())
+                resp = s.recv(1024).decode()
+                print(resp.strip())
+                return
+        except Exception:
+            pass
+
+    paused = pause_players()
+    temp_txt = f"/tmp/md2tts_{os.getpid()}.txt"
+    temp_mp3 = f"/tmp/md2tts_{os.getpid()}.mp3"
+    try:
+        with open(temp_txt, "w") as f:
+            f.write(text)
+        edge_bin = os.path.expanduser("~/.local/bin/edge-tts")
+        if not os.path.exists(edge_bin):
+            edge_bin = "edge-tts"
+        subprocess.run([edge_bin, "--file", temp_txt, "--voice", voice, "--rate", rate, "--write-media", temp_mp3], check=True)
+        subprocess.run(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", temp_mp3])
+    finally:
+        resume_players(paused)
+        for p in (temp_txt, temp_mp3):
+            if os.path.exists(p):
+                os.remove(p)
+
+def main():
+    parser = argparse.ArgumentParser(description="Clean markdown and queue TTS.")
+    parser.add_argument("file", nargs="?", default="-", help="Markdown file or - for stdin")
+    parser.add_argument("--voice", default="en-US-AvaNeural", help="Voice name (default: en-US-AvaNeural)")
+    parser.add_argument("--rate", default="+5%", help="Speech rate (default: +5%%)")
+    parser.add_argument("--flush", action="store_true", help="Prepend 'The, ' flush prefix")
+    args = parser.parse_args()
+
+    if args.file == "-":
+        content = sys.stdin.read()
+    else:
+        if not os.path.exists(args.file):
+            print(f"Error: file '{args.file}' not found.", file=sys.stderr)
+            sys.exit(1)
+        with open(args.file, "r", encoding="utf-8") as f:
+            content = f.read()
+
+    cleaned = strip_markdown(content)
+    if cleaned and not cleaned.endswith((".", "!", "?")):
+        cleaned += "."
+
+    if not cleaned:
+        return
+
+    send_to_mcp(cleaned, voice=args.voice, rate=args.rate, append_flush=args.flush)
+
+if __name__ == "__main__":
+    main()
