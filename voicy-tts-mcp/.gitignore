@@ -1,0 +1,10 @@
+# Rust build artifacts
+target/
+Cargo.lock
+
+# Editor & temporary files
+*.tmp
+*.log
+*.swp
+*.bak
+.DS_Store
